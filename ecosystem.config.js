@@ -9,7 +9,12 @@ module.exports = {
     restart_delay: 5000,        // Wait 5 seconds before trying to reconnect on crashes
     env: {
       PORT: 3000,
-      NODE_ENV: "production"
+      NODE_ENV: "production",
+	DB_HOST: "127.0.0.1",
+  	DB_PORT: 3306,
+  	DB_USER: "root",
+  	DB_PASSWORD: "bio!102938",
+  	DB_NAME: "baileys_manager"
     }
   }]
 };
