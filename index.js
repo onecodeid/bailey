@@ -14,11 +14,11 @@ app.use(cors());
 // MySQL connection pool — adjust credentials to match your environment
 // ---------------------------------------------------------------------------
 const db = mysql.createPool({
-    host:     process.env.DB_HOST     || '127.0.0.1',
-    port:     process.env.DB_PORT     || 3306,
-    user:     process.env.DB_USER     || 'root',
+    host: process.env.DB_HOST || '127.0.0.1',
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER || 'root',
     password: process.env.DB_PASSWORD || 'bio!102938',
-    database: process.env.DB_NAME     || 'baileys_manager',
+    database: process.env.DB_NAME || 'baileys_manager',
     waitForConnections: true,
     connectionLimit: 5
 });
@@ -44,9 +44,9 @@ async function initDb() {
 // ---------------------------------------------------------------------------
 // Runtime maps (in-memory, rebuilt on each boot)
 // ---------------------------------------------------------------------------
-const sessions       = new Map(); // sessionId -> sock
-const sessionStatus  = new Map(); // sessionId -> string
-const sessionQrs     = new Map(); // sessionId -> base64 image
+const sessions = new Map(); // sessionId -> sock
+const sessionStatus = new Map(); // sessionId -> string
+const sessionQrs = new Map(); // sessionId -> base64 image
 
 const MAX_SESSIONS = 10;
 
@@ -173,9 +173,9 @@ app.get('/api/sessions/list', async (req, res) => {
         const rows = await dbListSessions();
         const result = rows.map(row => ({
             session_id: row.session_id,
-            label:      row.label,
-            status:     sessionStatus.get(row.session_id) || 'DISCONNECTED',
-            phone:      row.phone,
+            label: row.label,
+            status: sessionStatus.get(row.session_id) || 'DISCONNECTED',
+            phone: row.phone,
             created_at: row.created_at
         }));
         res.json({ sessions: result, max: MAX_SESSIONS });
@@ -206,7 +206,7 @@ app.get('/api/session/status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     res.json({
         status: sessionStatus.get(sessionId) || 'DISCONNECTED',
-        qr:     sessionQrs.get(sessionId) || null
+        qr: sessionQrs.get(sessionId) || null
     });
 });
 
@@ -216,7 +216,7 @@ app.delete('/api/session/:sessionId', async (req, res) => {
     try {
         const sock = sessions.get(sessionId);
         if (sock) {
-            try { await sock.logout(); } catch (_) {}
+            try { await sock.logout(); } catch (_) { }
             sessions.delete(sessionId);
         }
         sessionStatus.delete(sessionId);
@@ -235,16 +235,47 @@ app.delete('/api/session/:sessionId', async (req, res) => {
 
 // Send a message
 app.post('/api/send-message', async (req, res) => {
-    const { sessionId, phone, message } = req.body;
-    const sock = sessions.get(sessionId);
-    if (!sock || sessionStatus.get(sessionId) !== 'CONNECTED') {
-        return res.status(400).json({ error: 'Session not ready' });
+    const sessionId =
+        req.headers['x-session-id'] ||
+        req.body.sessionId;
+
+    const phone =
+        req.body.phone ||
+        req.body.to;
+
+    const message = req.body.message;
+
+    if (!sessionId) {
+        return res.status(400).json({
+            error: 'Missing sessionId'
+        });
     }
+
+    const sock = sessions.get(sessionId);
+
+    if (!sock || sessionStatus.get(sessionId) !== 'CONNECTED') {
+        return res.status(400).json({
+            error: `Session ${sessionId} not ready`
+        });
+    }
+
     try {
-        await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: message });
-        res.json({ status: 'success' });
+        const jid = phone.includes('@')
+            ? phone
+            : `${phone}@s.whatsapp.net`;
+
+        const result = await sock.sendMessage(jid, {
+            text: message
+        });
+
+        res.json({
+            status: 'success',
+            messageId: result.key.id
+        });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({
+            error: e.message
+        });
     }
 });
 
