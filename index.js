@@ -11,7 +11,7 @@ app.use(cors()); // Allow UI connections
 
 const sessions = new Map();
 // Keep track of runtime status: 'DISCONNECTED', 'SCAN_QR', 'CONNECTING', 'CONNECTED'
-const sessionStatus = new Map(); 
+const sessionStatus = new Map();
 const sessionQrs = new Map();
 
 async function initWhatsAppSession(sessionId) {
@@ -43,10 +43,10 @@ async function initWhatsAppSession(sessionId) {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom) 
-                ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut 
+            const shouldReconnect = (lastDisconnect?.error instanceof Boom)
+                ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
                 : true;
-            
+
             if (shouldReconnect) {
                 sessionStatus.set(sessionId, 'CONNECTING');
                 initWhatsAppSession(sessionId);
@@ -70,7 +70,7 @@ async function initWhatsAppSession(sessionId) {
 app.post('/api/session/start', async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
-    
+
     initWhatsAppSession(sessionId); // Run asynchronously
     res.json({ status: 'Processing' });
 });
@@ -86,15 +86,48 @@ app.get('/api/session/status/:sessionId', (req, res) => {
 
 // Endpoint to Send Notification
 app.post('/api/send-message', async (req, res) => {
-    const { sessionId, phone, message } = req.body;
-    const sock = sessions.get(sessionId);
-    if (!sock || sessionStatus.get(sessionId) !== 'CONNECTED') {
-        return res.status(400).json({ error: 'Session not ready' });
+    const sessionId =
+        req.headers['x-session-id'] ||
+        req.body.sessionId;
+
+    const phone =
+        req.body.phone ||
+        req.body.to;
+
+    const message = req.body.message;
+
+    if (!sessionId) {
+        return res.status(400).json({
+            error: 'Missing sessionId'
+        });
     }
+
+    const sock = sessions.get(sessionId);
+
+    if (!sock || sessionStatus.get(sessionId) !== 'CONNECTED') {
+        return res.status(400).json({
+            error: `Session ${sessionId} not ready`
+        });
+    }
+
     try {
-        await sock.sendMessage(`${phone}@s.whatsapp.net`, { text: message });
-        res.json({ status: 'success' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const jid = phone.includes('@')
+            ? phone
+            : `${phone}@s.whatsapp.net`;
+
+        const result = await sock.sendMessage(jid, {
+            text: message
+        });
+
+        res.json({
+            status: 'success',
+            messageId: result.key.id
+        });
+    } catch (e) {
+        res.status(500).json({
+            error: e.message
+        });
+    }
 });
 
 app.listen(3000, () => console.log('Server loaded on port 3000'));
