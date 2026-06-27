@@ -1,17 +1,19 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const express = require('express');
 const { Boom } = require('@hapi/boom');
 const fs = require('fs');
+const https = require('https');
+const http = require('http');
 const cors = require('cors');
 const QRCode = require('qrcode');
 const mysql = require('mysql2/promise');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));  // large enough for base64-encoded media
 app.use(cors());
 
 // ---------------------------------------------------------------------------
-// MySQL connection pool — adjust credentials to match your environment
+// MySQL connection pool
 // ---------------------------------------------------------------------------
 const db = mysql.createPool({
     host: process.env.DB_HOST || '127.0.0.1',
@@ -24,7 +26,7 @@ const db = mysql.createPool({
 });
 
 // ---------------------------------------------------------------------------
-// DB bootstrap — create table if it doesn't exist
+// DB bootstrap
 // ---------------------------------------------------------------------------
 async function initDb() {
     await db.execute(`
@@ -42,11 +44,11 @@ async function initDb() {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime maps (in-memory, rebuilt on each boot)
+// Runtime maps
 // ---------------------------------------------------------------------------
 const sessions = new Map(); // sessionId -> sock
-const sessionStatus = new Map(); // sessionId -> string
-const sessionQrs = new Map(); // sessionId -> base64 image
+const sessionStatus = new Map(); // sessionId -> status string
+const sessionQrs = new Map(); // sessionId -> base64 QR image
 
 const MAX_SESSIONS = 10;
 
@@ -85,6 +87,35 @@ async function dbListSessions() {
         `SELECT session_id, label, status, phone, created_at FROM wa_sessions ORDER BY created_at ASC`
     );
     return rows;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Fetch a remote URL and return a Buffer */
+function fetchBuffer(url) {
+    return new Promise((resolve, reject) => {
+        const lib = url.startsWith('https') ? https : http;
+        lib.get(url, (res) => {
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+        }).on('error', reject);
+    });
+}
+
+/** Convert a data URI string to Buffer + mimeType */
+function dataUriToBuffer(dataUri) {
+    const m = dataUri.match(/^data:([^;]+);base64,(.+)$/);
+    if (!m) throw new Error('Invalid data URI');
+    return { mime: m[1], buffer: Buffer.from(m[2], 'base64') };
+}
+
+/** Normalise JID — strip @s.whatsapp.net if caller already added it */
+function normaliseJid(to) {
+    const digits = to.replace(/\D/g, '');
+    return digits + '@s.whatsapp.net';
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +160,6 @@ async function initWhatsAppSession(sessionId, label = '') {
                 await dbUpdateStatus(sessionId, 'CONNECTING');
                 initWhatsAppSession(sessionId, label);
             } else {
-                // Logged out — clean up everything
                 sessionStatus.set(sessionId, 'DISCONNECTED');
                 sessionQrs.delete(sessionId);
                 sessions.delete(sessionId);
@@ -158,16 +188,14 @@ async function restoreSessions() {
     const rows = await dbListSessions();
     console.log(`[BOOT] Restoring ${rows.length} session(s) from DB...`);
     for (const row of rows) {
-        await dbUpsertSession(row.session_id, row.label); // ensure record exists
+        await dbUpsertSession(row.session_id, row.label);
         initWhatsAppSession(row.session_id, row.label);
     }
 }
 
 // ---------------------------------------------------------------------------
-// API Routes
+// API Routes — session management (unchanged)
 // ---------------------------------------------------------------------------
-
-// List all registered sessions (with runtime status merged in)
 app.get('/api/sessions/list', async (req, res) => {
     try {
         const rows = await dbListSessions();
@@ -184,12 +212,10 @@ app.get('/api/sessions/list', async (req, res) => {
     }
 });
 
-// Register + start a new session
 app.post('/api/session/start', async (req, res) => {
     const { sessionId, label } = req.body;
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
-    // Enforce max cap
     const rows = await dbListSessions();
     const existing = rows.find(r => r.session_id === sessionId);
     if (!existing && rows.length >= MAX_SESSIONS) {
@@ -201,7 +227,6 @@ app.post('/api/session/start', async (req, res) => {
     res.json({ status: 'Processing', sessionId });
 });
 
-// Get status + QR for one session
 app.get('/api/session/status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     res.json({
@@ -210,7 +235,6 @@ app.get('/api/session/status/:sessionId', (req, res) => {
     });
 });
 
-// Disconnect + delete a session
 app.delete('/api/session/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
     try {
@@ -233,49 +257,92 @@ app.delete('/api/session/:sessionId', async (req, res) => {
     }
 });
 
-// Send a message
+// ---------------------------------------------------------------------------
+// API Route — send message (text / image / document)
+// ---------------------------------------------------------------------------
 app.post('/api/send-message', async (req, res) => {
-    const sessionId =
-        req.headers['x-session-id'] ||
-        req.body.sessionId;
+    const sessionId = req.headers['x-session-id'] || req.body.sessionId;
+    const to = req.body.to || req.body.phone;
+    const type = req.body.type || 'text';   // 'text' | 'image' | 'document'
+    const message = req.body.message || '';
+    const caption = req.body.caption || '';
+    const filename = req.body.filename || 'file';
+    const mediaUrl = req.body.url || '';
+    const mediaData = req.body.media || '';     // base64 data URI from api.php
 
-    const phone =
-        req.body.phone ||
-        req.body.to;
-
-    const message = req.body.message;
-
-    if (!sessionId) {
-        return res.status(400).json({
-            error: 'Missing sessionId'
-        });
-    }
+    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId (x-session-id header)' });
+    if (!to) return res.status(400).json({ error: 'Missing "to" field' });
 
     const sock = sessions.get(sessionId);
-
     if (!sock || sessionStatus.get(sessionId) !== 'CONNECTED') {
-        return res.status(400).json({
-            error: `Session ${sessionId} not ready`
-        });
+        return res.status(400).json({ error: `Session "${sessionId}" is not connected` });
     }
 
     try {
-        const jid = phone.includes('@')
-            ? phone
-            : `${phone}@s.whatsapp.net`;
+        const jid = to.includes('@') ? to : normaliseJid(to);
+        let result;
 
-        const result = await sock.sendMessage(jid, {
-            text: message
-        });
+        // ── TEXT ─────────────────────────────────────────────────────────────
+        if (type === 'text') {
+            if (!message) return res.status(400).json({ error: '"message" is required for text type' });
+            result = await sock.sendMessage(jid, { text: message });
+
+            // ── IMAGE ────────────────────────────────────────────────────────────
+        } else if (type === 'image') {
+            let imageBuffer;
+
+            if (mediaData && mediaData.startsWith('data:')) {
+                // Uploaded file sent as base64 data URI
+                const { buffer } = dataUriToBuffer(mediaData);
+                imageBuffer = buffer;
+            } else if (mediaUrl) {
+                // Remote URL
+                imageBuffer = await fetchBuffer(mediaUrl);
+            } else {
+                return res.status(400).json({ error: 'Provide "media" (base64) or "url" for image type' });
+            }
+
+            result = await sock.sendMessage(jid, {
+                image: imageBuffer,
+                caption: caption
+            });
+
+            // ── DOCUMENT ─────────────────────────────────────────────────────────
+        } else if (type === 'document') {
+            let docBuffer;
+            let mimeType = 'application/octet-stream';
+
+            if (mediaData && mediaData.startsWith('data:')) {
+                const { buffer, mime } = dataUriToBuffer(mediaData);
+                docBuffer = buffer;
+                mimeType = mime;
+            } else if (mediaUrl) {
+                docBuffer = await fetchBuffer(mediaUrl);
+            } else {
+                return res.status(400).json({ error: 'Provide "media" (base64) or "url" for document type' });
+            }
+
+            result = await sock.sendMessage(jid, {
+                document: docBuffer,
+                mimetype: mimeType,
+                fileName: filename,
+                caption: caption
+            });
+
+        } else {
+            return res.status(400).json({ error: `Unknown type "${type}". Use: text | image | document` });
+        }
 
         res.json({
             status: 'success',
-            messageId: result.key.id
+            messageId: result.key.id,
+            type: type,
+            to: jid
         });
+
     } catch (e) {
-        res.status(500).json({
-            error: e.message
-        });
+        console.error(`[SEND] Error for session ${sessionId}:`, e.message);
+        res.status(500).json({ error: e.message });
     }
 });
 
